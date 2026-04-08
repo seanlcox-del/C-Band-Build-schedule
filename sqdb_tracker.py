@@ -1,0 +1,782 @@
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from pathlib import Path
+import re
+from datetime import datetime, date
+
+st.set_page_config(
+    page_title="SQDB 30-60-90 Tracker",
+    page_icon="📡",
+    layout="wide",
+)
+
+FOLDER = Path(__file__).parent
+TODAY = date(2026, 4, 7)
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+def phase_label(month_ts):
+    """Return 30 / 60 / 90 / Beyond label relative to TODAY."""
+    m = pd.Timestamp(month_ts)
+    current = pd.Timestamp(TODAY.replace(day=1))
+    diff = (m.year - current.year) * 12 + (m.month - current.month)
+    if diff == 0:
+        return "30-Day"
+    elif diff == 1:
+        return "60-Day"
+    elif diff == 2:
+        return "90-Day"
+    else:
+        return "Beyond"
+
+@st.cache_data(show_spinner="Loading weekly files…")
+def load_all_files():
+    pattern = re.compile(r"FWA_CBAND_Forecast_Sites_(\d{8})")
+    records = []
+    for f in sorted(FOLDER.glob("FWA_CBAND_Forecast_Sites_*.xlsx")):
+        m = pattern.search(f.stem)
+        if not m:
+            continue
+        snap_date = pd.to_datetime(m.group(1), format="%Y%m%d").date()
+        if snap_date.year != 2026:
+            continue
+        try:
+            df = pd.read_excel(f, engine="openpyxl")
+            df["Snapshot"] = snap_date
+            records.append(df)
+        except Exception:
+            pass
+    if not records:
+        return pd.DataFrame()
+    all_df = pd.concat(records, ignore_index=True)
+    all_df["Forecast Month"] = pd.to_datetime(all_df["Forecast Month"])
+    all_df["Phase"] = all_df["Forecast Month"].apply(phase_label)
+    return all_df
+
+# ── load ───────────────────────────────────────────────────────────────────
+
+all_df = load_all_files()
+
+if all_df.empty:
+    st.error("No forecast files found in this folder.")
+    st.stop()
+
+snapshots_available = sorted(all_df["Snapshot"].unique())
+latest_snap = max(snapshots_available)
+markets_available = sorted(all_df["Market"].dropna().unique())
+
+# ── sidebar ────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.title("📡 SQDB Tracker")
+    st.caption("FWA C-Band Forecast — OFS Sites")
+    st.divider()
+
+    selected_markets = st.multiselect(
+        "Filter by Market",
+        options=markets_available,
+        default=[],
+        placeholder="All markets",
+    )
+
+    num_weeks = st.slider("Weeks of history to show", min_value=4, max_value=len(snapshots_available), value=min(12, len(snapshots_available)))
+    recent_snaps = snapshots_available[-num_weeks:]
+
+    st.divider()
+    st.caption(f"Latest snapshot: **{latest_snap}**")
+    st.caption(f"Total weekly files: **{len(snapshots_available)}**")
+
+# ── filter ────────────────────────────────────────────────────────────────
+
+df = all_df.copy()
+if selected_markets:
+    df = df[df["Market"].isin(selected_markets)]
+
+latest_df = df[df["Snapshot"] == latest_snap]
+recent_df = df[df["Snapshot"].isin(recent_snaps)]
+
+# ── page title ────────────────────────────────────────────────────────────
+
+st.title("SQDB 30-60-90 Schedule Tracker")
+st.caption(f"FWA C-Band · As of {latest_snap} · Today: {TODAY}")
+
+PHASES = ["30-Day", "60-Day", "90-Day"]
+PHASE_COLORS = {"30-Day": "#0d6efd", "60-Day": "#198754", "90-Day": "#fd7e14"}
+
+# ── KPI cards (latest snapshot) ───────────────────────────────────────────
+
+st.subheader("Current Forecast Snapshot")
+
+phase_summary = (
+    latest_df[latest_df["Phase"].isin(PHASES)]
+    .groupby("Phase")
+    .agg(Sites=("Fuze Site ID", "nunique"), VCG_OFS=("VCG-OFS", "sum"), VBG_OFS=("VBG-OFS", "sum"))
+    .reindex(PHASES)
+    .fillna(0)
+    .astype({"Sites": int, "VCG_OFS": int, "VBG_OFS": int})
+    .reset_index()
+)
+
+cols = st.columns(3)
+for col, (_, row) in zip(cols, phase_summary.iterrows()):
+    with col:
+        color = PHASE_COLORS[row["Phase"]]
+        st.markdown(
+            f"""
+            <div style="border-left: 5px solid {color}; padding: 12px 16px; background: #f8f9fa; border-radius: 4px;">
+                <div style="font-size:1.1rem; font-weight:700; color:{color}">{row['Phase']}</div>
+                <div style="font-size:2rem; font-weight:800; margin:4px 0">{row['Sites']:,}</div>
+                <div style="font-size:0.8rem; color:#555">Sites</div>
+                <div style="margin-top:8px; font-size:0.85rem">
+                    VCG-OFS: <b>{row['VCG_OFS']:,}</b><br>
+                    VBG-OFS: <b>{row['VBG_OFS']:,}</b>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+st.divider()
+
+# ── tabs ──────────────────────────────────────────────────────────────────
+
+tab_trend, tab_cumulative, tab_compare, tab_adherence, tab_market, tab_detail, tab_map = st.tabs(["Week-over-Week Trend", "Cumulative OFS", "Snapshot Comparison", "Schedule Adherence", "Market Breakdown", "Site Detail", "Site Map"])
+
+# ── TREND TAB ─────────────────────────────────────────────────────────────
+with tab_trend:
+    trend_df = (
+        recent_df[recent_df["Phase"].isin(PHASES)]
+        .groupby(["Snapshot", "Phase"])
+        .agg(Sites=("Fuze Site ID", "nunique"), VCG_OFS=("VCG-OFS", "sum"), VBG_OFS=("VBG-OFS", "sum"))
+        .reset_index()
+    )
+
+    metric = st.radio("Metric", ["Sites", "VCG-OFS", "VBG-OFS"], horizontal=True)
+    col_map = {"Sites": "Sites", "VCG-OFS": "VCG_OFS", "VBG-OFS": "VBG_OFS"}
+    y_col = col_map[metric]
+
+    fig = go.Figure()
+    for phase in PHASES:
+        phase_data = trend_df[trend_df["Phase"] == phase].sort_values("Snapshot")
+        fig.add_trace(go.Scatter(
+            x=phase_data["Snapshot"],
+            y=phase_data[y_col],
+            name=phase,
+            mode="lines+markers",
+            line=dict(color=PHASE_COLORS[phase], width=2),
+            marker=dict(size=6),
+            hovertemplate=f"<b>{phase}</b><br>Week: %{{x}}<br>{metric}: %{{y:,}}<extra></extra>",
+        ))
+
+    fig.update_layout(
+        title=f"{metric} by Phase — Week-over-Week",
+        xaxis_title="Snapshot Week",
+        yaxis_title=metric,
+        hovermode="x unified",
+        height=420,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(t=60, b=40),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    # WoW delta table
+    st.subheader("Week-over-Week Delta (latest vs prior week)")
+    if len(snapshots_available) >= 2:
+        prev_snap = snapshots_available[-2]
+        prev_df_f = df[df["Snapshot"] == prev_snap]
+        curr_summary = (
+            latest_df[latest_df["Phase"].isin(PHASES)]
+            .groupby("Phase")
+            .agg(Sites_now=("Fuze Site ID", "nunique"), VCG_now=("VCG-OFS", "sum"), VBG_now=("VBG-OFS", "sum"))
+        )
+        prev_summary = (
+            prev_df_f[prev_df_f["Phase"].isin(PHASES)]
+            .groupby("Phase")
+            .agg(Sites_prev=("Fuze Site ID", "nunique"), VCG_prev=("VCG-OFS", "sum"), VBG_prev=("VBG-OFS", "sum"))
+        )
+        delta = curr_summary.join(prev_summary).reindex(PHASES).fillna(0).astype(int)
+        delta["Δ Sites"] = delta["Sites_now"] - delta["Sites_prev"]
+        delta["Δ VCG-OFS"] = delta["VCG_now"] - delta["VCG_prev"]
+        delta["Δ VBG-OFS"] = delta["VBG_now"] - delta["VBG_prev"]
+        display_delta = delta[["Sites_now", "Sites_prev", "Δ Sites", "VCG_now", "VCG_prev", "Δ VCG-OFS", "VBG_now", "VBG_prev", "Δ VBG-OFS"]].rename(columns={
+            "Sites_now": f"Sites ({latest_snap})",
+            "Sites_prev": f"Sites ({prev_snap})",
+            "VCG_now": f"VCG ({latest_snap})",
+            "VCG_prev": f"VCG ({prev_snap})",
+            "VBG_now": f"VBG ({latest_snap})",
+            "VBG_prev": f"VBG ({prev_snap})",
+        })
+
+        def color_delta(val):
+            if isinstance(val, (int, float)):
+                if val > 0:
+                    return "color: green"
+                elif val < 0:
+                    return "color: red"
+            return ""
+
+        st.dataframe(
+            display_delta.style.map(color_delta, subset=["Δ Sites", "Δ VCG-OFS", "Δ VBG-OFS"]),
+            width="stretch",
+        )
+
+# ── CUMULATIVE TAB ────────────────────────────────────────────────────────
+with tab_cumulative:
+    st.subheader("Cumulative OFS by Forecast Date")
+    st.caption("Running total of addresses from the latest snapshot, ordered by site forecast date.")
+
+    cum_metric = st.radio("Metric", ["VCG-OFS", "VBG-OFS", "Both"], horizontal=True, key="cum_metric")
+
+    # Daily totals from latest snapshot, within 30/60/90 phases only
+    daily = (
+        latest_df[latest_df["Phase"].isin(PHASES)]
+        .groupby("Forecast Date")
+        .agg(VCG=("VCG-OFS", "sum"), VBG=("VBG-OFS", "sum"), Sites=("Fuze Site ID", "nunique"))
+        .reset_index()
+        .sort_values("Forecast Date")
+    )
+    daily["Cum VCG-OFS"] = daily["VCG"].cumsum()
+    daily["Cum VBG-OFS"] = daily["VBG"].cumsum()
+    daily["Cum Sites"] = daily["Sites"].cumsum()
+
+    # Phase boundary lines
+    phase_bounds = (
+        latest_df[latest_df["Phase"].isin(PHASES)]
+        .groupby("Phase")["Forecast Date"]
+        .max()
+        .reindex(PHASES)
+    )
+
+    fig_cum = go.Figure()
+
+    if cum_metric in ("VCG-OFS", "Both"):
+        fig_cum.add_trace(go.Scatter(
+            x=daily["Forecast Date"],
+            y=daily["Cum VCG-OFS"],
+            name="Cumulative VCG-OFS",
+            mode="lines",
+            line=dict(color="#0d6efd", width=2),
+            fill="tozeroy",
+            fillcolor="rgba(13,110,253,0.08)",
+            hovertemplate="Date: %{x}<br>Cum VCG-OFS: %{y:,}<extra></extra>",
+        ))
+
+    if cum_metric in ("VBG-OFS", "Both"):
+        fig_cum.add_trace(go.Scatter(
+            x=daily["Forecast Date"],
+            y=daily["Cum VBG-OFS"],
+            name="Cumulative VBG-OFS",
+            mode="lines",
+            line=dict(color="#fd7e14", width=2),
+            fill="tozeroy",
+            fillcolor="rgba(253,126,20,0.08)",
+            hovertemplate="Date: %{x}<br>Cum VBG-OFS: %{y:,}<extra></extra>",
+        ))
+
+    # Vertical phase boundary lines (add as shapes + annotations manually)
+    for phase, color in PHASE_COLORS.items():
+        bound = phase_bounds.get(phase)
+        if pd.notna(bound):
+            x_ts = pd.Timestamp(bound).timestamp() * 1000  # ms epoch for plotly
+            fig_cum.add_shape(
+                type="line",
+                xref="x", yref="paper",
+                x0=x_ts, x1=x_ts, y0=0, y1=1,
+                line=dict(color=color, dash="dash", width=1.5),
+            )
+            fig_cum.add_annotation(
+                x=x_ts, yref="paper", y=1.02,
+                text=phase, showarrow=False,
+                font=dict(color=color, size=12),
+                xanchor="center",
+            )
+
+    fig_cum.update_layout(
+        xaxis_title="Forecast Date",
+        yaxis_title="Cumulative OFS Addresses",
+        hovermode="x unified",
+        height=450,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(t=60, b=40),
+    )
+    st.plotly_chart(fig_cum, width="stretch")
+
+    # Cumulative milestones at each phase boundary
+    st.subheader("Cumulative Totals at Phase Boundaries")
+    rows = []
+    for phase in PHASES:
+        bound = phase_bounds.get(phase)
+        if pd.isna(bound):
+            continue
+        snap = daily[daily["Forecast Date"] <= bound]
+        if snap.empty:
+            continue
+        last = snap.iloc[-1]
+        rows.append({
+            "Phase": phase,
+            "Through Date": bound.date() if hasattr(bound, "date") else bound,
+            "Cum Sites": int(last["Cum Sites"]),
+            "Cum VCG-OFS": int(last["Cum VCG-OFS"]),
+            "Cum VBG-OFS": int(last["Cum VBG-OFS"]),
+        })
+    if rows:
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
+# ── SNAPSHOT COMPARISON TAB ───────────────────────────────────────────────
+with tab_compare:
+    st.subheader("Snapshot Comparison")
+
+    snap_options = [str(s) for s in snapshots_available]
+    col_a, col_b = st.columns(2)
+    with col_a:
+        snap_a = st.selectbox("Snapshot A (baseline)", snap_options, index=max(0, len(snap_options) - 2), key="snap_a")
+    with col_b:
+        snap_b = st.selectbox("Snapshot B (compare)", snap_options, index=len(snap_options) - 1, key="snap_b")
+
+    cmp_markets = st.multiselect("Filter by Market", options=markets_available, default=[], placeholder="All markets", key="cmp_markets")
+    cmp_metric = st.radio("Metric", ["Sites", "VCG-OFS", "VBG-OFS"], horizontal=True, key="cmp_metric")
+    cmp_col = {"Sites": ("Fuze Site ID", "nunique"), "VCG-OFS": ("VCG-OFS", "sum"), "VBG-OFS": ("VBG-OFS", "sum")}
+
+    def snap_summary(snap_str, group_col=None):
+        snap_date = pd.to_datetime(snap_str).date()
+        sdf = df[(df["Snapshot"] == snap_date) & (df["Phase"].isin(PHASES))]
+        if cmp_markets:
+            sdf = sdf[sdf["Market"].isin(cmp_markets)]
+        gb = [group_col, "Phase"] if group_col else ["Phase"]
+        agg_col, agg_fn = cmp_col[cmp_metric]
+        return sdf.groupby(gb)[agg_col].agg(agg_fn).rename(cmp_metric).reset_index()
+
+    sum_a = snap_summary(snap_a)
+    sum_b = snap_summary(snap_b)
+
+    # ── Grouped bar chart by phase ─────────────────────────────────────────
+    fig_cmp = go.Figure()
+    for label, sdata, pattern in [(snap_a, sum_a, ""), (snap_b, sum_b, "/")]:
+        fig_cmp.add_trace(go.Bar(
+            name=label,
+            x=sdata["Phase"],
+            y=sdata[cmp_metric],
+            text=sdata[cmp_metric].apply(lambda v: f"{v:,}"),
+            textposition="outside",
+            marker_pattern_shape=pattern,
+        ))
+
+    fig_cmp.update_layout(
+        barmode="group",
+        title=f"{cmp_metric} by Phase — {snap_a} vs {snap_b}",
+        xaxis_title="Phase",
+        yaxis_title=cmp_metric,
+        height=420,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(t=60, b=40),
+    )
+    st.plotly_chart(fig_cmp, width="stretch")
+
+    # ── Delta summary table ────────────────────────────────────────────────
+    st.subheader(f"Delta: {snap_b} vs {snap_a}")
+    merged = sum_a.merge(sum_b, on="Phase", suffixes=(" A", " B")).set_index("Phase").reindex(PHASES)
+    merged["Δ"] = merged[f"{cmp_metric} B"] - merged[f"{cmp_metric} A"]
+    merged["Δ %"] = (merged["Δ"] / merged[f"{cmp_metric} A"].replace(0, float("nan")) * 100).round(1)
+    merged = merged.rename(columns={f"{cmp_metric} A": snap_a, f"{cmp_metric} B": snap_b}).fillna(0).astype({snap_a: int, snap_b: int, "Δ": int})
+
+    def style_delta(val):
+        if isinstance(val, (int, float)):
+            if val > 0: return "color: green; font-weight: bold"
+            if val < 0: return "color: red; font-weight: bold"
+        return ""
+
+    st.dataframe(merged.style.map(style_delta, subset=["Δ", "Δ %"]), width="stretch")
+
+    # ── Market-level comparison ────────────────────────────────────────────
+    with st.expander("Market-level breakdown"):
+        sum_a_mkt = snap_summary(snap_a, "Market")
+        sum_b_mkt = snap_summary(snap_b, "Market")
+        mkt_merged = sum_a_mkt.merge(sum_b_mkt, on=["Market", "Phase"], suffixes=(" A", " B"))
+        mkt_merged["Δ"] = mkt_merged[f"{cmp_metric} B"] - mkt_merged[f"{cmp_metric} A"]
+
+        pivot_delta = mkt_merged.pivot_table(index="Market", columns="Phase", values="Δ", fill_value=0).reindex(columns=PHASES, fill_value=0)
+        pivot_delta["Total Δ"] = pivot_delta.sum(axis=1)
+        pivot_delta = pivot_delta.sort_values("Total Δ")
+
+        fig_mkt_cmp = go.Figure()
+        for phase in PHASES:
+            fig_mkt_cmp.add_trace(go.Bar(
+                name=phase,
+                y=pivot_delta.index,
+                x=pivot_delta[phase],
+                orientation="h",
+                marker_color=PHASE_COLORS[phase],
+            ))
+        fig_mkt_cmp.update_layout(
+            barmode="relative",
+            title=f"{cmp_metric} Delta by Market ({snap_a} → {snap_b})",
+            height=max(500, len(pivot_delta) * 20),
+            xaxis_title=f"Δ {cmp_metric}",
+            margin=dict(l=130, t=60, b=40),
+            legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1),
+        )
+        st.plotly_chart(fig_mkt_cmp, width="stretch")
+
+
+# ── SCHEDULE ADHERENCE TAB ────────────────────────────────────────────────
+with tab_adherence:
+    st.subheader("Schedule Adherence")
+    st.caption(
+        "Compares each site's forecasted month in a baseline snapshot against a later snapshot. "
+        "**On Schedule** = same or earlier month. **Slipped** = moved to a later month. "
+        "**Completed/Dropped** = site no longer in the later snapshot."
+    )
+
+    adh_col1, adh_col2 = st.columns(2)
+    valid_snaps = [str(s) for s in snapshots_available]
+    with adh_col1:
+        base_snap = st.selectbox("Baseline snapshot", valid_snaps, index=0, key="adh_base")
+    with adh_col2:
+        comp_snap = st.selectbox("Compare snapshot", valid_snaps, index=len(valid_snaps) - 1, key="adh_comp")
+
+    adh_col3, adh_col4, adh_col5 = st.columns(3)
+    with adh_col3:
+        adh_markets = st.multiselect("Filter by Market", options=markets_available, default=[], placeholder="All markets", key="adh_markets")
+    with adh_col4:
+        sub_market_options = sorted(df["Sub Market"].dropna().unique()) if not adh_markets else sorted(df[df["Market"].isin(adh_markets)]["Sub Market"].dropna().unique())
+        adh_submarkets = st.multiselect("Filter by Sub Market", options=sub_market_options, default=[], placeholder="All sub markets", key="adh_submarkets")
+    with adh_col5:
+        adh_phases = st.multiselect("Filter by Phase (baseline)", options=PHASES, default=[], placeholder="All phases", key="adh_phases")
+
+    base_date = pd.to_datetime(base_snap).date()
+    comp_date = pd.to_datetime(comp_snap).date()
+
+    base_raw = df[df["Snapshot"] == base_date].copy()
+    comp_raw = df[df["Snapshot"] == comp_date].copy()
+    if adh_markets:
+        base_raw = base_raw[base_raw["Market"].isin(adh_markets)]
+        comp_raw = comp_raw[comp_raw["Market"].isin(adh_markets)]
+    if adh_submarkets:
+        base_raw = base_raw[base_raw["Sub Market"].isin(adh_submarkets)]
+        comp_raw = comp_raw[comp_raw["Sub Market"].isin(adh_submarkets)]
+    if adh_phases:
+        base_raw = base_raw[base_raw["Phase"].isin(adh_phases)]
+
+    # Deduplicate: one row per site — use earliest Forecast Month per site per snapshot
+    base_sites = (
+        base_raw.groupby("Fuze Site ID")
+        .agg(Base_Month=("Forecast Month", "min"), Market=("Market", "first"), Sub_Market=("Sub Market", "first"), VCG=("VCG-OFS", "sum"), VBG=("VBG-OFS", "sum"))
+        .reset_index()
+    )
+    base_sites["Base_Month"] = pd.to_datetime(base_sites["Base_Month"])
+
+    comp_sites = (
+        comp_raw.groupby("Fuze Site ID")
+        .agg(Comp_Month=("Forecast Month", "min"))
+        .reset_index()
+    )
+    comp_sites["Comp_Month"] = pd.to_datetime(comp_sites["Comp_Month"])
+
+    merged = base_sites.merge(comp_sites, on="Fuze Site ID", how="left")
+    today_ts = pd.Timestamp(TODAY)
+
+    def classify(row):
+        if pd.isna(row["Comp_Month"]):
+            return "Completed / Dropped"
+        if row["Comp_Month"] <= row["Base_Month"]:
+            return "On Schedule"
+        return "Slipped"
+
+    merged["Status"] = merged.apply(classify, axis=1)
+    merged["Months Slipped"] = (
+        (merged["Comp_Month"].dt.year - merged["Base_Month"].dt.year) * 12 +
+        (merged["Comp_Month"].dt.month - merged["Base_Month"].dt.month)
+    ).clip(lower=0)
+
+    # ── KPI row ───────────────────────────────────────────────────────────
+    status_counts = merged["Status"].value_counts()
+    total = len(merged)
+    on_sched = status_counts.get("On Schedule", 0)
+    slipped   = status_counts.get("Slipped", 0)
+    dropped   = status_counts.get("Completed / Dropped", 0)
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Total Sites (baseline)", f"{total:,}")
+    pct = lambda n: f"{n/total*100:.1f}%" if total else "—"
+    k2.metric("On Schedule", f"{on_sched:,}", pct(on_sched))
+    k3.metric("Slipped", f"{slipped:,}", f"-{pct(slipped)}" if slipped else "0%", delta_color="inverse")
+    k4.metric("Completed / Dropped", f"{dropped:,}", pct(dropped))
+
+    st.divider()
+
+    left, right = st.columns(2)
+
+    # ── Donut chart ───────────────────────────────────────────────────────
+    with left:
+        STATUS_COLORS = {"On Schedule": "#198754", "Slipped": "#dc3545", "Completed / Dropped": "#6c757d"}
+        labels = list(status_counts.index)
+        values = list(status_counts.values)
+        colors = [STATUS_COLORS.get(l, "#aaa") for l in labels]
+        fig_donut = go.Figure(go.Pie(
+            labels=labels, values=values,
+            hole=0.5,
+            marker_colors=colors,
+            textinfo="label+percent",
+            hovertemplate="%{label}: %{value:,} sites<extra></extra>",
+        ))
+        fig_donut.update_layout(title="Schedule Status", height=350, margin=dict(t=50, b=20))
+        st.plotly_chart(fig_donut, width="stretch")
+
+    # ── Slippage distribution ─────────────────────────────────────────────
+    with right:
+        slip_df = merged[merged["Status"] == "Slipped"]
+        if not slip_df.empty:
+            slip_dist = slip_df["Months Slipped"].value_counts().sort_index().reset_index()
+            slip_dist.columns = ["Months Slipped", "Sites"]
+            fig_slip = go.Figure(go.Bar(
+                x=slip_dist["Months Slipped"].astype(str) + "mo",
+                y=slip_dist["Sites"],
+                marker_color="#dc3545",
+                text=slip_dist["Sites"],
+                textposition="outside",
+                hovertemplate="Slipped %{x}: %{y:,} sites<extra></extra>",
+            ))
+            fig_slip.update_layout(
+                title="Slippage Distribution",
+                xaxis_title="Months Slipped",
+                yaxis_title="Sites",
+                height=350,
+                margin=dict(t=50, b=40),
+            )
+            st.plotly_chart(fig_slip, width="stretch")
+        else:
+            st.info("No slipped sites in this comparison.")
+
+    # ── Market adherence breakdown ────────────────────────────────────────
+    st.subheader("Market Breakdown")
+    mkt_adh = (
+        merged.groupby(["Market", "Status"])
+        .size()
+        .reset_index(name="Sites")
+        .pivot_table(index="Market", columns="Status", values="Sites", fill_value=0)
+    )
+    for col in ["On Schedule", "Slipped", "Completed / Dropped"]:
+        if col not in mkt_adh.columns:
+            mkt_adh[col] = 0
+    mkt_adh = mkt_adh[["On Schedule", "Slipped", "Completed / Dropped"]]
+    mkt_adh["Total"] = mkt_adh.sum(axis=1)
+    mkt_adh["On Schedule %"] = (mkt_adh["On Schedule"] / mkt_adh["Total"].replace(0, float("nan")) * 100).round(1).fillna(0)
+    mkt_adh = mkt_adh.sort_values("On Schedule %", ascending=True)
+
+    fig_mkt_adh = go.Figure()
+    for status, color in STATUS_COLORS.items():
+        if status in mkt_adh.columns:
+            fig_mkt_adh.add_trace(go.Bar(
+                name=status,
+                y=mkt_adh.index,
+                x=mkt_adh[status],
+                orientation="h",
+                marker_color=color,
+                hovertemplate=f"{status}: %{{x:,}}<extra></extra>",
+            ))
+    fig_mkt_adh.update_layout(
+        barmode="stack",
+        title="Sites by Status per Market",
+        height=max(500, len(mkt_adh) * 20),
+        margin=dict(l=130, t=60, b=40),
+        xaxis_title="Sites",
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1),
+    )
+    st.plotly_chart(fig_mkt_adh, width="stretch")
+
+    # ── Site detail ───────────────────────────────────────────────────────
+    with st.expander("Site-level detail"):
+        status_filter = st.selectbox("Status filter", ["All", "On Schedule", "Slipped", "Completed / Dropped"], key="adh_status")
+        detail_df = merged.copy()
+        if status_filter != "All":
+            detail_df = detail_df[detail_df["Status"] == status_filter]
+        detail_df = detail_df.sort_values(["Status", "Market", "Months Slipped"], ascending=[True, True, False])
+        st.dataframe(
+            detail_df[["Fuze Site ID", "Market", "Sub_Market", "Status", "Base_Month", "Comp_Month", "Months Slipped", "VCG", "VBG"]]
+            .rename(columns={"Sub_Market": "Sub Market", "Base_Month": f"Forecast ({base_snap})", "Comp_Month": f"Forecast ({comp_snap})", "VCG": "VCG-OFS", "VBG": "VBG-OFS"})
+            .reset_index(drop=True),
+            width="stretch",
+            hide_index=True,
+        )
+        st.caption(f"{len(detail_df):,} sites")
+
+
+# ── MARKET TAB ────────────────────────────────────────────────────────────
+with tab_market:
+    market_phase = (
+        latest_df[latest_df["Phase"].isin(PHASES)]
+        .groupby(["Market", "Phase"])
+        .agg(Sites=("Fuze Site ID", "nunique"), VCG_OFS=("VCG-OFS", "sum"))
+        .reset_index()
+    )
+
+    metric_m = st.radio("Metric ", ["Sites", "VCG-OFS"], horizontal=True, key="mkt_metric")
+    y_col_m = "Sites" if metric_m == "Sites" else "VCG_OFS"
+
+    # Pivot for sorted bar chart
+    pivot = market_phase.pivot_table(index="Market", columns="Phase", values=y_col_m, fill_value=0).reindex(columns=PHASES, fill_value=0)
+    pivot["Total"] = pivot.sum(axis=1)
+    pivot = pivot.sort_values("Total", ascending=True).drop(columns="Total")
+
+    fig_m = go.Figure()
+    for phase in PHASES:
+        fig_m.add_trace(go.Bar(
+            name=phase,
+            y=pivot.index,
+            x=pivot[phase],
+            orientation="h",
+            marker_color=PHASE_COLORS[phase],
+        ))
+    fig_m.update_layout(
+        barmode="stack",
+        title=f"{metric_m} by Market and Phase",
+        height=max(500, len(pivot) * 20),
+        margin=dict(l=130, t=60, b=40),
+        xaxis_title=metric_m,
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1),
+    )
+    st.plotly_chart(fig_m, width="stretch")
+
+    # Market summary table
+    market_table = (
+        latest_df[latest_df["Phase"].isin(PHASES)]
+        .groupby("Market")
+        .agg(
+            Total_Sites=("Fuze Site ID", "nunique"),
+            VCG_OFS=("VCG-OFS", "sum"),
+            VBG_OFS=("VBG-OFS", "sum"),
+        )
+        .sort_values("Total_Sites", ascending=False)
+        .reset_index()
+    )
+    st.dataframe(market_table, width="stretch", hide_index=True)
+
+# ── DETAIL TAB ────────────────────────────────────────────────────────────
+with tab_detail:
+    st.subheader("Site-Level Detail")
+
+    phase_filter = st.selectbox("Phase", ["All"] + PHASES)
+    filtered = latest_df[latest_df["Phase"].isin(PHASES)].copy()
+    if phase_filter != "All":
+        filtered = filtered[filtered["Phase"] == phase_filter]
+
+    filtered = filtered.sort_values(["Phase", "Market", "Forecast Date"])
+
+    show_cols = ["Phase", "Market", "Sub Market", "Fuze Site ID", "CMA Name", "Zip Code", "Forecast Date", "VCG-OFS", "VBG-OFS"]
+    st.dataframe(
+        filtered[show_cols].reset_index(drop=True),
+        width="stretch",
+        hide_index=True,
+    )
+    st.caption(f"{len(filtered):,} rows")
+
+
+# ── MAP TAB ───────────────────────────────────────────────────────────────
+with tab_map:
+    st.subheader("Site Map")
+    st.caption(
+        "Future build sites by phase (latest snapshot) and completed sites "
+        "(present in prior snapshots but absent from the latest)."
+    )
+
+    mc1, mc2, mc3 = st.columns(3)
+    with mc1:
+        map_markets = st.multiselect("Market filter", markets_available, default=[], key="map_markets")
+    with mc2:
+        map_phases = st.multiselect("Future phases", PHASES, default=PHASES, key="map_phases")
+    with mc3:
+        map_show_completed = st.checkbox("Show completed sites", value=True, key="map_show_completed")
+
+    # ── Future sites (latest snapshot) ────────────────────────────────────
+    filt_latest = latest_df[latest_df["Phase"].isin(map_phases)].copy()
+    if map_markets:
+        filt_latest = filt_latest[filt_latest["Market"].isin(map_markets)]
+    filt_latest = filt_latest.drop_duplicates("Fuze Site ID").copy()
+    filt_latest["_Category"] = filt_latest["Phase"]
+    filt_latest["_ForecastDate"] = pd.to_datetime(filt_latest["Forecast Date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("—")
+    filt_latest["_VCG"] = filt_latest["VCG-OFS"].fillna(0).astype(int)
+    filt_latest["_VBG"] = filt_latest["VBG-OFS"].fillna(0).astype(int)
+
+    # ── Completed sites (in history but not in latest) ─────────────────────
+    if map_show_completed:
+        latest_ids = set(latest_df["Fuze Site ID"].dropna().unique())
+        hist = all_df[~all_df["Fuze Site ID"].isin(latest_ids)].copy()
+        if map_markets:
+            hist = hist[hist["Market"].isin(map_markets)]
+        comp_sites = hist.sort_values("Snapshot", ascending=False).drop_duplicates("Fuze Site ID").copy()
+        comp_sites["_Category"] = "Completed"
+        comp_sites["_ForecastDate"] = pd.to_datetime(comp_sites["Forecast Date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("—") if "Forecast Date" in comp_sites.columns else "—"
+        comp_sites["_VCG"] = comp_sites["VCG-OFS"].fillna(0).astype(int) if "VCG-OFS" in comp_sites.columns else 0
+        comp_sites["_VBG"] = comp_sites["VBG-OFS"].fillna(0).astype(int) if "VBG-OFS" in comp_sites.columns else 0
+    else:
+        comp_sites = pd.DataFrame()
+
+    # ── Combine ────────────────────────────────────────────────────────────
+    use_cols = ["Fuze Site ID", "Market", "Sub Market", "Site Latitude", "Site Longitude",
+                "_Category", "_ForecastDate", "_VCG", "_VBG"]
+    parts = []
+    if not filt_latest.empty:
+        parts.append(filt_latest[[c for c in use_cols if c in filt_latest.columns]])
+    if not comp_sites.empty:
+        parts.append(comp_sites[[c for c in use_cols if c in comp_sites.columns]])
+
+    if not parts:
+        st.info("No sites match the current filters.")
+    else:
+        map_df = pd.concat(parts, ignore_index=True)
+        map_df["Site Latitude"] = pd.to_numeric(map_df["Site Latitude"], errors="coerce")
+        map_df["Site Longitude"] = pd.to_numeric(map_df["Site Longitude"], errors="coerce")
+        map_df = map_df.dropna(subset=["Site Latitude", "Site Longitude"])
+        map_df = map_df[map_df["Site Latitude"].between(-90, 90) & map_df["Site Longitude"].between(-180, 180)]
+
+        if map_df.empty:
+            st.warning("No sites with valid coordinates found. Confirm 'Site Latitude' / 'Site Longitude' columns are populated.")
+        else:
+            MAP_COLORS = {"30-Day": "#0d6efd", "60-Day": "#198754", "90-Day": "#fd7e14", "Completed": "#dc3545"}
+            categories = map_phases + (["Completed"] if map_show_completed else [])
+
+            fig_map = go.Figure()
+            for cat in categories:
+                sub = map_df[map_df["_Category"] == cat]
+                if sub.empty:
+                    continue
+                fig_map.add_trace(go.Scattermapbox(
+                    lat=sub["Site Latitude"],
+                    lon=sub["Site Longitude"],
+                    mode="markers",
+                    name=cat,
+                    marker=dict(
+                        size=9,
+                        color=MAP_COLORS.get(cat, "#aaa"),
+                        opacity=0.85,
+                    ),
+                    customdata=sub[["Fuze Site ID", "Market", "Sub Market", "_ForecastDate", "_VCG", "_VBG"]].values,
+                    hovertemplate=(
+                        "<b>%{customdata[0]}</b><br>"
+                        "Market: %{customdata[1]}<br>"
+                        "Sub Market: %{customdata[2]}<br>"
+                        f"Phase: {cat}<br>"
+                        "Forecast Date: %{customdata[3]}<br>"
+                        "VCG-OFS: %{customdata[4]:,}<br>"
+                        "VBG-OFS: %{customdata[5]:,}<extra></extra>"
+                    ),
+                ))
+
+            fig_map.update_layout(
+                mapbox=dict(
+                    style="open-street-map",
+                    center=dict(lat=map_df["Site Latitude"].mean(), lon=map_df["Site Longitude"].mean()),
+                    zoom=4,
+                ),
+                height=640,
+                margin=dict(t=20, b=10, l=0, r=0),
+                legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig_map, width="stretch")
+
+            n_future = (map_df["_Category"] != "Completed").sum()
+            n_comp = (map_df["_Category"] == "Completed").sum()
+            st.caption(f"{len(map_df):,} sites plotted — {n_future:,} future builds · {n_comp:,} completed")
