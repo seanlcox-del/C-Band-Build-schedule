@@ -7,18 +7,18 @@ import re
 from datetime import datetime, date
 
 st.set_page_config(
-    page_title="SQDB 30-60-90 Tracker",
+    page_title="SQDB 30-60-90-120 Tracker",
     page_icon="📡",
     layout="wide",
 )
 
 FOLDER = Path(__file__).parent
-TODAY = date(2026, 4, 7)
+TODAY = date(2026, 4, 9)
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
 def phase_label(month_ts):
-    """Return 30 / 60 / 90 / Beyond label relative to TODAY."""
+    """Return 30 / 60 / 90 / 120 / Beyond label relative to TODAY."""
     m = pd.Timestamp(month_ts)
     current = pd.Timestamp(TODAY.replace(day=1))
     diff = (m.year - current.year) * 12 + (m.month - current.month)
@@ -28,23 +28,47 @@ def phase_label(month_ts):
         return "60-Day"
     elif diff == 2:
         return "90-Day"
+    elif diff == 3:
+        return "120-Day"
     else:
         return "Beyond"
+
+@st.cache_data(show_spinner="Loading on-air dates…")
+def load_onair_dates():
+    path = Path(r"C:\Users\v296938\Desktop\04082026 FWA CBAND Capacity_Full Data_data.csv")
+    if not path.exists():
+        return pd.DataFrame(columns=["Fuze Site ID", "On Air Date"])
+    odf = pd.read_csv(path, usecols=["Fuze Site ID", "On Air Date"])
+    odf["On Air Date"] = pd.to_datetime(odf["On Air Date"], errors="coerce")
+    return odf.dropna(subset=["Fuze Site ID"]).groupby("Fuze Site ID")["On Air Date"].min().reset_index()
 
 @st.cache_data(show_spinner="Loading weekly files…")
 def load_all_files():
     pattern = re.compile(r"FWA_CBAND_Forecast_Sites_(\d{8})")
     records = []
-    for f in sorted(FOLDER.glob("FWA_CBAND_Forecast_Sites_*.xlsx")):
+    all_files = sorted(
+        list(FOLDER.glob("FWA_CBAND_Forecast_Sites_*.xlsx")) +
+        list(FOLDER.glob("FWA_CBAND_Forecast_Sites_*.csv"))
+    )
+    for f in all_files:
         m = pattern.search(f.stem)
         if not m:
             continue
         snap_date = pd.to_datetime(m.group(1), format="%Y%m%d").date()
-        if snap_date.year != 2026:
+        if snap_date.year not in (2025, 2026):
             continue
         try:
-            df = pd.read_excel(f, engine="openpyxl")
+            if f.suffix.lower() == ".csv":
+                df = pd.read_csv(f)
+            else:
+                df = pd.read_excel(f, engine="openpyxl")
             df["Snapshot"] = snap_date
+            # For 2025 snapshot files, keep only rows with 2026 Forecast Month
+            if snap_date.year == 2025:
+                df["Forecast Month"] = pd.to_datetime(df["Forecast Month"])
+                df = df[df["Forecast Month"].dt.year == 2026]
+                if df.empty:
+                    continue
             records.append(df)
         except Exception:
             pass
@@ -99,11 +123,11 @@ recent_df = df[df["Snapshot"].isin(recent_snaps)]
 
 # ── page title ────────────────────────────────────────────────────────────
 
-st.title("SQDB 30-60-90 Schedule Tracker")
+st.title("SQDB 30-60-90-120 Schedule Tracker")
 st.caption(f"FWA C-Band · As of {latest_snap} · Today: {TODAY}")
 
-PHASES = ["30-Day", "60-Day", "90-Day"]
-PHASE_COLORS = {"30-Day": "#0d6efd", "60-Day": "#198754", "90-Day": "#fd7e14"}
+PHASES = ["30-Day", "60-Day", "90-Day", "120-Day"]
+PHASE_COLORS = {"30-Day": "#0d6efd", "60-Day": "#198754", "90-Day": "#fd7e14", "120-Day": "#6f42c1"}
 
 # ── KPI cards (latest snapshot) ───────────────────────────────────────────
 
@@ -119,7 +143,7 @@ phase_summary = (
     .reset_index()
 )
 
-cols = st.columns(3)
+cols = st.columns(4)
 for col, (_, row) in zip(cols, phase_summary.iterrows()):
     with col:
         color = PHASE_COLORS[row["Phase"]]
@@ -427,7 +451,7 @@ with tab_adherence:
     st.caption(
         "Compares each site's forecasted month in a baseline snapshot against a later snapshot. "
         "**On Schedule** = same or earlier month. **Slipped** = moved to a later month. "
-        "**Completed/Dropped** = site no longer in the later snapshot."
+        "**Completed** = no longer on report, has On Air Date. **Dropped** = no longer on report, no On Air Date."
     )
 
     adh_col1, adh_col2 = st.columns(2)
@@ -449,24 +473,39 @@ with tab_adherence:
     base_date = pd.to_datetime(base_snap).date()
     comp_date = pd.to_datetime(comp_snap).date()
 
-    base_raw = df[df["Snapshot"] == base_date].copy()
     comp_raw = df[df["Snapshot"] == comp_date].copy()
-    if adh_markets:
-        base_raw = base_raw[base_raw["Market"].isin(adh_markets)]
-        comp_raw = comp_raw[comp_raw["Market"].isin(adh_markets)]
-    if adh_submarkets:
-        base_raw = base_raw[base_raw["Sub Market"].isin(adh_submarkets)]
-        comp_raw = comp_raw[comp_raw["Sub Market"].isin(adh_submarkets)]
-    if adh_phases:
-        base_raw = base_raw[base_raw["Phase"].isin(adh_phases)]
 
-    # Deduplicate: one row per site — use earliest Forecast Month per site per snapshot
-    base_sites = (
-        base_raw.groupby("Fuze Site ID")
-        .agg(Base_Month=("Forecast Month", "min"), Market=("Market", "first"), Sub_Market=("Sub Market", "first"), VCG=("VCG-OFS", "sum"), VBG=("VBG-OFS", "sum"))
+    # Universe: all sites ever seen across all snapshots
+    # Base month = forecast month from baseline snapshot if present, else earliest ever seen
+    base_fm_snap = (
+        df[df["Snapshot"] == base_date]
+        .groupby("Fuze Site ID")
+        .agg(Base_Month_Snap=("Forecast Month", "min"))
         .reset_index()
     )
-    base_sites["Base_Month"] = pd.to_datetime(base_sites["Base_Month"])
+    universe = (
+        df.groupby("Fuze Site ID")
+        .agg(Base_Month_Early=("Forecast Month", "min"),
+             Market=("Market", "first"), Sub_Market=("Sub Market", "first"),
+             VCG=("VCG-OFS", "sum"), VBG=("VBG-OFS", "sum"))
+        .reset_index()
+    )
+    base_sites = universe.merge(base_fm_snap, on="Fuze Site ID", how="left")
+    base_sites["Base_Month"] = pd.to_datetime(
+        base_sites["Base_Month_Snap"].combine_first(base_sites["Base_Month_Early"])
+    )
+    base_sites = base_sites.drop(columns=["Base_Month_Snap", "Base_Month_Early"])
+
+    # Apply market / submarket / phase filters to universe
+    if adh_markets:
+        base_sites = base_sites[base_sites["Market"].isin(adh_markets)]
+        comp_raw   = comp_raw[comp_raw["Market"].isin(adh_markets)]
+    if adh_submarkets:
+        base_sites = base_sites[base_sites["Sub Market"].isin(adh_submarkets)]
+        comp_raw   = comp_raw[comp_raw["Sub Market"].isin(adh_submarkets)]
+    if adh_phases:
+        base_sites["_Phase"] = base_sites["Base_Month"].apply(phase_label)
+        base_sites = base_sites[base_sites["_Phase"].isin(adh_phases)].drop(columns=["_Phase"])
 
     comp_sites = (
         comp_raw.groupby("Fuze Site ID")
@@ -476,11 +515,16 @@ with tab_adherence:
     comp_sites["Comp_Month"] = pd.to_datetime(comp_sites["Comp_Month"])
 
     merged = base_sites.merge(comp_sites, on="Fuze Site ID", how="left")
-    today_ts = pd.Timestamp(TODAY)
+
+    onair_df = load_onair_dates()
+    onair_ids = set(onair_df["Fuze Site ID"].dropna().astype(str))
+    comp_snap_month = pd.Timestamp(comp_date).to_period("M").to_timestamp()
 
     def classify(row):
         if pd.isna(row["Comp_Month"]):
-            return "Completed / Dropped"
+            return "Completed" if str(row["Fuze Site ID"]) in onair_ids else "Dropped"
+        if row["Comp_Month"] < comp_snap_month:
+            return "Slipped"  # Past due — still on report but forecast month already passed
         if row["Comp_Month"] <= row["Base_Month"]:
             return "On Schedule"
         return "Slipped"
@@ -493,17 +537,59 @@ with tab_adherence:
 
     # ── KPI row ───────────────────────────────────────────────────────────
     status_counts = merged["Status"].value_counts()
-    total = len(merged)
-    on_sched = status_counts.get("On Schedule", 0)
+    total     = len(merged)
+    on_sched  = status_counts.get("On Schedule", 0)
     slipped   = status_counts.get("Slipped", 0)
-    dropped   = status_counts.get("Completed / Dropped", 0)
+    completed = status_counts.get("Completed", 0)
+    dropped   = status_counts.get("Dropped", 0)
 
-    k1, k2, k3, k4 = st.columns(4)
+    k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Total Sites (baseline)", f"{total:,}")
     pct = lambda n: f"{n/total*100:.1f}%" if total else "—"
     k2.metric("On Schedule", f"{on_sched:,}", pct(on_sched))
     k3.metric("Slipped", f"{slipped:,}", f"-{pct(slipped)}" if slipped else "0%", delta_color="inverse")
-    k4.metric("Completed / Dropped", f"{dropped:,}", pct(dropped))
+    k4.metric("Completed", f"{completed:,}", pct(completed))
+    k5.metric("Dropped", f"{dropped:,}", f"-{pct(dropped)}" if dropped else "0%", delta_color="inverse")
+
+    st.divider()
+
+    # ── Week-over-week trend ──────────────────────────────────────────────
+    trend_snaps = [s for s in snapshots_available if s >= base_date]
+    trend_rows = []
+    for snap in trend_snaps:
+        snap_raw = df[df["Snapshot"] == snap].groupby("Fuze Site ID").agg(Comp_Month=("Forecast Month", "min")).reset_index()
+        snap_raw["Comp_Month"] = pd.to_datetime(snap_raw["Comp_Month"])
+        snap_merged = base_sites.merge(snap_raw, on="Fuze Site ID", how="left")
+        snap_month = pd.Timestamp(snap).to_period("M").to_timestamp()
+        def _classify(row, _sm=snap_month):
+            if pd.isna(row["Comp_Month"]):
+                return "Completed" if str(row["Fuze Site ID"]) in onair_ids else "Dropped"
+            if row["Comp_Month"] < _sm:
+                return "Slipped"
+            return "On Schedule" if row["Comp_Month"] <= row["Base_Month"] else "Slipped"
+        snap_merged["Status"] = snap_merged.apply(_classify, axis=1)
+        sc = snap_merged["Status"].value_counts()
+        trend_rows.append({"Snapshot": snap, "On Schedule": sc.get("On Schedule", 0),
+                            "Slipped": sc.get("Slipped", 0), "Completed": sc.get("Completed", 0),
+                            "Dropped": sc.get("Dropped", 0)})
+    trend_df = pd.DataFrame(trend_rows)
+
+    STATUS_COLORS_TREND = {"On Schedule": "#198754", "Slipped": "#dc3545", "Completed": "#fd7e14", "Dropped": "#6c757d"}
+    fig_trend = go.Figure()
+    for status, color in STATUS_COLORS_TREND.items():
+        fig_trend.add_trace(go.Scatter(
+            x=trend_df["Snapshot"], y=trend_df[status],
+            name=status, mode="lines+markers",
+            line=dict(color=color, width=2), marker=dict(size=6),
+            hovertemplate=f"<b>{status}</b><br>%{{x}}<br>Sites: %{{y:,}}<extra></extra>",
+        ))
+    fig_trend.update_layout(
+        title="Status Trend (Baseline → Each Snapshot)",
+        xaxis_title="Snapshot", yaxis_title="Sites",
+        height=320, margin=dict(t=50, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.plotly_chart(fig_trend, width="stretch")
 
     st.divider()
 
@@ -511,7 +597,7 @@ with tab_adherence:
 
     # ── Donut chart ───────────────────────────────────────────────────────
     with left:
-        STATUS_COLORS = {"On Schedule": "#198754", "Slipped": "#dc3545", "Completed / Dropped": "#6c757d"}
+        STATUS_COLORS = {"On Schedule": "#198754", "Slipped": "#dc3545", "Completed": "#dc3545", "Dropped": "#6c757d"}
         labels = list(status_counts.index)
         values = list(status_counts.values)
         colors = [STATUS_COLORS.get(l, "#aaa") for l in labels]
@@ -558,10 +644,10 @@ with tab_adherence:
         .reset_index(name="Sites")
         .pivot_table(index="Market", columns="Status", values="Sites", fill_value=0)
     )
-    for col in ["On Schedule", "Slipped", "Completed / Dropped"]:
+    for col in ["On Schedule", "Slipped", "Completed", "Dropped"]:
         if col not in mkt_adh.columns:
             mkt_adh[col] = 0
-    mkt_adh = mkt_adh[["On Schedule", "Slipped", "Completed / Dropped"]]
+    mkt_adh = mkt_adh[["On Schedule", "Slipped", "Completed", "Dropped"]]
     mkt_adh["Total"] = mkt_adh.sum(axis=1)
     mkt_adh["On Schedule %"] = (mkt_adh["On Schedule"] / mkt_adh["Total"].replace(0, float("nan")) * 100).round(1).fillna(0)
     mkt_adh = mkt_adh.sort_values("On Schedule %", ascending=True)
@@ -589,7 +675,7 @@ with tab_adherence:
 
     # ── Site detail ───────────────────────────────────────────────────────
     with st.expander("Site-level detail"):
-        status_filter = st.selectbox("Status filter", ["All", "On Schedule", "Slipped", "Completed / Dropped"], key="adh_status")
+        status_filter = st.selectbox("Status filter", ["All", "On Schedule", "Slipped", "Completed", "Dropped"], key="adh_status")
         detail_df = merged.copy()
         if status_filter != "All":
             detail_df = detail_df[detail_df["Status"] == status_filter]
@@ -700,14 +786,16 @@ with tab_map:
     filt_latest["_VCG"] = filt_latest["VCG-OFS"].fillna(0).astype(int)
     filt_latest["_VBG"] = filt_latest["VBG-OFS"].fillna(0).astype(int)
 
-    # ── Completed sites (in history but not in latest) ─────────────────────
+    # ── Completed / Dropped sites (in history but not in latest) ──────────
     if map_show_completed:
+        onair_df = load_onair_dates()
         latest_ids = set(latest_df["Fuze Site ID"].dropna().unique())
         hist = all_df[~all_df["Fuze Site ID"].isin(latest_ids)].copy()
         if map_markets:
             hist = hist[hist["Market"].isin(map_markets)]
         comp_sites = hist.sort_values("Snapshot", ascending=False).drop_duplicates("Fuze Site ID").copy()
-        comp_sites["_Category"] = "Completed"
+        comp_sites = comp_sites.merge(onair_df[["Fuze Site ID", "On Air Date"]], on="Fuze Site ID", how="left")
+        comp_sites["_Category"] = comp_sites["On Air Date"].apply(lambda d: "Completed" if pd.notna(d) else "Dropped")
         comp_sites["_ForecastDate"] = pd.to_datetime(comp_sites["Forecast Date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("—") if "Forecast Date" in comp_sites.columns else "—"
         comp_sites["_VCG"] = comp_sites["VCG-OFS"].fillna(0).astype(int) if "VCG-OFS" in comp_sites.columns else 0
         comp_sites["_VBG"] = comp_sites["VBG-OFS"].fillna(0).astype(int) if "VBG-OFS" in comp_sites.columns else 0
@@ -735,8 +823,8 @@ with tab_map:
         if map_df.empty:
             st.warning("No sites with valid coordinates found. Confirm 'Site Latitude' / 'Site Longitude' columns are populated.")
         else:
-            MAP_COLORS = {"30-Day": "#0d6efd", "60-Day": "#198754", "90-Day": "#fd7e14", "Completed": "#dc3545"}
-            categories = map_phases + (["Completed"] if map_show_completed else [])
+            MAP_COLORS = {"30-Day": "#0d6efd", "60-Day": "#198754", "90-Day": "#fd7e14", "120-Day": "#6f42c1", "Completed": "#dc3545", "Dropped": "#212529"}
+            categories = map_phases + (["Completed", "Dropped"] if map_show_completed else [])
 
             fig_map = go.Figure()
             for cat in categories:
@@ -777,6 +865,7 @@ with tab_map:
             )
             st.plotly_chart(fig_map, width="stretch")
 
-            n_future = (map_df["_Category"] != "Completed").sum()
+            n_future = map_df["_Category"].isin(PHASES).sum()
             n_comp = (map_df["_Category"] == "Completed").sum()
-            st.caption(f"{len(map_df):,} sites plotted — {n_future:,} future builds · {n_comp:,} completed")
+            n_dropped = (map_df["_Category"] == "Dropped").sum()
+            st.caption(f"{len(map_df):,} sites plotted — {n_future:,} future builds · {n_comp:,} completed (red) · {n_dropped:,} dropped (black)")
