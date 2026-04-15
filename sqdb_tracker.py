@@ -47,8 +47,8 @@ def load_all_files():
     pattern = re.compile(r"FWA_CBAND_Forecast_Sites_(\d{8})")
     records = []
     all_files = sorted(
-        list(FOLDER.glob("FWA_CBAND_Forecast_Sites_*.xlsx")) +
-        list(FOLDER.glob("FWA_CBAND_Forecast_Sites_*.csv"))
+        list(FOLDER.glob("**/FWA_CBAND_Forecast_Sites_*.xlsx")) +
+        list(FOLDER.glob("**/FWA_CBAND_Forecast_Sites_*.csv"))
     )
     for f in all_files:
         m = pattern.search(f.stem)
@@ -62,6 +62,8 @@ def load_all_files():
                 df = pd.read_csv(f)
             else:
                 df = pd.read_excel(f, engine="openpyxl")
+            if "Fuze Site ID" not in df.columns:
+                continue
             df["Snapshot"] = snap_date
             # For 2025 snapshot files, keep only rows with 2026 Forecast Month
             if snap_date.year == 2025:
@@ -680,14 +682,25 @@ with tab_adherence:
         if status_filter != "All":
             detail_df = detail_df[detail_df["Status"] == status_filter]
         detail_df = detail_df.sort_values(["Status", "Market", "Months Slipped"], ascending=[True, True, False])
-        st.dataframe(
+        display_df = (
             detail_df[["Fuze Site ID", "Market", "Sub_Market", "Status", "Base_Month", "Comp_Month", "Months Slipped", "VCG", "VBG"]]
             .rename(columns={"Sub_Market": "Sub Market", "Base_Month": f"Forecast ({base_snap})", "Comp_Month": f"Forecast ({comp_snap})", "VCG": "VCG-OFS", "VBG": "VBG-OFS"})
-            .reset_index(drop=True),
+            .reset_index(drop=True)
+        )
+        adh_sel = st.dataframe(
+            display_df,
             width="stretch",
             hide_index=True,
+            selection_mode="single-row",
+            on_select="rerun",
+            key="adh_detail_sel",
         )
-        st.caption(f"{len(detail_df):,} sites")
+        rows_sel = adh_sel.selection.rows
+        if rows_sel:
+            clicked_id = str(int(display_df.iloc[rows_sel[0]]["Fuze Site ID"]))
+            st.session_state["_hist_prefill"] = clicked_id
+            st.toast(f"Site {clicked_id} selected — open the Site Detail tab to view history")
+        st.caption(f"{len(detail_df):,} sites — click any row to load its history in the Site Detail tab")
 
 
 # ── MARKET TAB ────────────────────────────────────────────────────────────
@@ -744,14 +757,172 @@ with tab_market:
 with tab_detail:
     st.subheader("Site-Level Detail")
 
-    phase_filter = st.selectbox("Phase", ["All"] + PHASES)
-    filtered = latest_df[latest_df["Phase"].isin(PHASES)].copy()
+    # ── Compute Status (On Schedule / Slipped) using earliest snap as baseline ──
+    earliest_snap = min(snapshots_available)
+    _base_fm_snap = (
+        df[df["Snapshot"] == earliest_snap]
+        .groupby("Fuze Site ID")
+        .agg(Base_Month_Snap=("Forecast Month", "min"))
+        .reset_index()
+    )
+    _earliest_fm = (
+        df.groupby("Fuze Site ID")
+        .agg(Base_Month_Early=("Forecast Month", "min"))
+        .reset_index()
+    )
+    _base_lookup = _base_fm_snap.merge(_earliest_fm, on="Fuze Site ID", how="right")
+    _base_lookup["Base_Month"] = pd.to_datetime(
+        _base_lookup["Base_Month_Snap"].combine_first(_base_lookup["Base_Month_Early"])
+    )
+    _base_lookup = _base_lookup[["Fuze Site ID", "Base_Month"]]
+
+    _det_onair_ids = set(load_onair_dates()["Fuze Site ID"].dropna().astype(str))
+    _latest_snap_month = pd.Timestamp(latest_snap).to_period("M").to_timestamp()
+
+    det_df = latest_df[latest_df["Phase"].isin(PHASES)].copy()
+    det_df = det_df.merge(_base_lookup, on="Fuze Site ID", how="left")
+    det_df["_Comp_Month"] = pd.to_datetime(det_df["Forecast Month"])
+
+    def _classify_detail(row):
+        if pd.isna(row["_Comp_Month"]):
+            return "Completed" if str(row["Fuze Site ID"]) in _det_onair_ids else "Dropped"
+        if row["_Comp_Month"] < _latest_snap_month:
+            return "Slipped"
+        if row["_Comp_Month"] <= row["Base_Month"]:
+            return "On Schedule"
+        return "Slipped"
+
+    det_df["Status"] = det_df.apply(_classify_detail, axis=1)
+
+    # ── Site History Search ───────────────────────────────────────────────
+    st.markdown("### Site History")
+    _prefill = st.session_state.get("_hist_prefill", "")
+    if _prefill:
+        st.session_state["site_hist_input"] = _prefill
+        del st.session_state["_hist_prefill"]
+    site_id_input = st.text_input("Search Fuze Site ID", placeholder="e.g. 12345", key="site_hist_input")
+
+    if site_id_input.strip():
+        site_hist = all_df[all_df["Fuze Site ID"].astype(str) == site_id_input.strip()].copy()
+
+        if site_hist.empty:
+            st.warning(f"No data found for Fuze Site ID: {site_id_input.strip()}")
+        else:
+            site_hist["Forecast Month"] = pd.to_datetime(site_hist["Forecast Month"])
+            base_fm = site_hist["Forecast Month"].min()
+            first_snap = site_hist["Snapshot"].min()
+
+            # On Air Date lookup
+            _odf = load_onair_dates()
+            _orow = _odf[_odf["Fuze Site ID"].astype(str) == site_id_input.strip()]
+            on_air_date = _orow["On Air Date"].iloc[0] if not _orow.empty else None
+
+            # Metadata from first appearance
+            _first = site_hist.sort_values("Snapshot").iloc[0]
+            _market = _first["Market"] if "Market" in site_hist.columns else "—"
+            _submarket = _first["Sub Market"] if "Sub Market" in site_hist.columns else "—"
+
+            # KPI row
+            k1, k2, k3, k4, k5 = st.columns(5)
+            k1.metric("Market", _market)
+            k2.metric("Sub Market", _submarket)
+            k3.metric("First Snapshot", str(first_snap))
+            k4.metric("Original FM", base_fm.strftime("%b %Y") if pd.notna(base_fm) else "—")
+            k5.metric("On Air Date", on_air_date.strftime("%Y-%m-%d") if pd.notna(on_air_date) else "—")
+
+            # Build full history across all snapshots
+            hist_rows = []
+            for snap in snapshots_available:
+                snap_month_ts = pd.Timestamp(snap).to_period("M").to_timestamp()
+                snap_site = site_hist[site_hist["Snapshot"] == snap]
+                if not snap_site.empty:
+                    fm = snap_site["Forecast Month"].min()
+                    phase = phase_label(fm)
+                    vcg = int(snap_site["VCG-OFS"].sum()) if "VCG-OFS" in snap_site.columns else 0
+                    vbg = int(snap_site["VBG-OFS"].sum()) if "VBG-OFS" in snap_site.columns else 0
+                    if fm < snap_month_ts:
+                        status = "Slipped"
+                    elif fm <= base_fm:
+                        status = "On Schedule"
+                    else:
+                        status = "Slipped"
+                    hist_rows.append({"Snapshot": snap, "Forecast Month": fm.strftime("%b %Y"),
+                                      "Phase": phase, "Status": status, "VCG-OFS": vcg, "VBG-OFS": vbg, "In Report": "✓"})
+                elif snap > first_snap:
+                    status = "Completed" if site_id_input.strip() in _det_onair_ids else "Dropped"
+                    hist_rows.append({"Snapshot": snap, "Forecast Month": "—",
+                                      "Phase": "—", "Status": status, "VCG-OFS": "—", "VBG-OFS": "—", "In Report": "✗"})
+
+            hist_df = pd.DataFrame(hist_rows)
+
+            # Forecast month timeline chart
+            chart_pts = site_hist.groupby("Snapshot")["Forecast Month"].min().reset_index()
+            chart_pts["Forecast Month"] = pd.to_datetime(chart_pts["Forecast Month"])
+
+            fig_hist = go.Figure()
+            fig_hist.add_trace(go.Scatter(
+                x=chart_pts["Snapshot"],
+                y=chart_pts["Forecast Month"],
+                mode="lines+markers",
+                name="Forecast Month",
+                line=dict(color="#0d6efd", width=2),
+                marker=dict(size=8),
+                hovertemplate="Snapshot: %{x}<br>Forecast Month: %{y|%b %Y}<extra></extra>",
+            ))
+            x_min = chart_pts["Snapshot"].min()
+            x_max = chart_pts["Snapshot"].max()
+            fig_hist.add_shape(type="line",
+                x0=x_min, x1=x_max, y0=base_fm, y1=base_fm,
+                line=dict(color="#6c757d", width=1, dash="dash"))
+            fig_hist.add_annotation(
+                x=x_min, y=base_fm, text="Original FM",
+                showarrow=False, yshift=10, xanchor="left",
+                font=dict(size=11, color="#6c757d"))
+            fig_hist.update_layout(
+                title=f"Forecast Month History — Site {site_id_input.strip()}",
+                xaxis_title="Snapshot", yaxis_title="Forecast Month",
+                yaxis=dict(tickformat="%b %Y"),
+                height=320, margin=dict(t=50, b=40),
+            )
+            st.plotly_chart(fig_hist, width="stretch")
+
+            # History table with color-coded status
+            def _color_hist_status(val):
+                c = {"On Schedule": "color: #198754", "Slipped": "color: #dc3545",
+                     "Completed": "color: #fd7e14", "Dropped": "color: #6c757d"}
+                return c.get(val, "")
+
+            st.dataframe(
+                hist_df.style.map(_color_hist_status, subset=["Status"]),
+                width="stretch", hide_index=True,
+            )
+            st.caption(f"Site {site_id_input.strip()} · {site_hist['Snapshot'].nunique()} snapshots with active data")
+            st.download_button(
+                label="Export CSV",
+                data=hist_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"site_{site_id_input.strip()}_history.csv",
+                mime="text/csv",
+            )
+
+    st.divider()
+    st.subheader("Browse All Sites")
+
+    det_col1, det_col2 = st.columns(2)
+    with det_col1:
+        phase_filter = st.selectbox("Phase", ["All"] + PHASES)
+    with det_col2:
+        status_filter_det = st.selectbox("Status", ["All", "On Schedule", "Slipped"], key="det_status")
+
+    filtered = det_df.copy()
     if phase_filter != "All":
         filtered = filtered[filtered["Phase"] == phase_filter]
+    if status_filter_det != "All":
+        filtered = filtered[filtered["Status"] == status_filter_det]
 
-    filtered = filtered.sort_values(["Phase", "Market", "Forecast Date"])
+    filtered = filtered.sort_values(["Status", "Phase", "Market", "Forecast Date"])
 
-    show_cols = ["Phase", "Market", "Sub Market", "Fuze Site ID", "CMA Name", "Zip Code", "Forecast Date", "VCG-OFS", "VBG-OFS"]
+    show_cols = ["Status", "Phase", "Market", "Sub Market", "Fuze Site ID", "CMA Name", "Zip Code", "Forecast Date", "VCG-OFS", "VBG-OFS"]
+    show_cols = [c for c in show_cols if c in filtered.columns]
     st.dataframe(
         filtered[show_cols].reset_index(drop=True),
         width="stretch",
