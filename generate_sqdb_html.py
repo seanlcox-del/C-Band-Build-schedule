@@ -38,14 +38,14 @@ def phase_label(month_ts):
 print("Loading weekly files…")
 pat, records = re.compile(r"FWA_CBAND_Forecast_Sites_(\d{8})"), []
 all_files = sorted(
-    list(FOLDER.glob("FWA_CBAND_Forecast_Sites_*.xlsx")) +
-    list(FOLDER.glob("FWA_CBAND_Forecast_Sites_*.csv"))
+    list(FOLDER.glob("**/FWA_CBAND_Forecast_Sites_*.xlsx")) +
+    list(FOLDER.glob("**/FWA_CBAND_Forecast_Sites_*.csv"))
 )
 for f in all_files:
     m = pat.search(f.stem)
     if not m: continue
     snap_date = pd.to_datetime(m.group(1), format="%Y%m%d").date()
-    if snap_date.year != 2026: continue
+    if snap_date.year not in (2025, 2026): continue
     try:
         if f.suffix.lower() == ".csv":
             df = pd.read_csv(f)
@@ -53,6 +53,11 @@ for f in all_files:
             df = pd.read_excel(f, engine="openpyxl")
         if "Fuze Site ID" not in df.columns: continue
         df["Snapshot"] = snap_date
+        # For 2025 snapshot files, keep only rows with 2026 Forecast Month
+        if snap_date.year == 2025:
+            df["Forecast Month"] = pd.to_datetime(df["Forecast Month"])
+            df = df[df["Forecast Month"].dt.year == 2026]
+            if df.empty: continue
         records.append(df)
         print(f"  + {f.name}")
     except Exception as e:
@@ -148,13 +153,17 @@ for snap in snapshots:
     grp = (sdf.groupby("Fuze Site ID")
               .agg(fm=("Forecast Month", "min"),
                    mkt=("Market", "first"),
-                   sm=("Sub Market", "first"))
+                   sm=("Sub Market", "first"),
+                   vcg=("VCG-OFS", "sum"),
+                   vbg=("VBG-OFS", "sum"))
               .reset_index())
     all_snap_data[str(snap)] = [
         {"id": str(int(r["Fuze Site ID"])),
          "fm": pd.Timestamp(r["fm"]).strftime("%Y-%m"),
          "mkt": str(r["mkt"]) if pd.notna(r["mkt"]) else "",
-         "sm":  str(r["sm"])  if pd.notna(r["sm"])  else ""}
+         "sm":  str(r["sm"])  if pd.notna(r["sm"])  else "",
+         "vcg": int(r["vcg"]) if pd.notna(r["vcg"]) else 0,
+         "vbg": int(r["vbg"]) if pd.notna(r["vbg"]) else 0}
         for _, r in grp.iterrows()
     ]
 
@@ -196,7 +205,39 @@ det["Forecast Date"]  = pd.to_datetime(det["Forecast Date"], errors="coerce").dt
 det["Fuze Site ID"]   = det["Fuze Site ID"].astype(str)
 det["VCG-OFS"] = pd.to_numeric(det["VCG-OFS"], errors="coerce").fillna(0).astype(int)
 det["VBG-OFS"] = pd.to_numeric(det["VBG-OFS"], errors="coerce").fillna(0).astype(int)
-det = det.sort_values(["Phase","Market","Forecast Date"])
+
+# Compute Status (On Schedule / Slipped) using earliest snapshot as baseline
+_earliest_snap_dt = min(snapshots)
+_base_fm_snap = (
+    all_df[all_df["Snapshot"] == _earliest_snap_dt]
+    .groupby("Fuze Site ID").agg(Base_Month_Snap=("Forecast Month","min")).reset_index()
+)
+_base_fm_snap["Fuze Site ID"] = _base_fm_snap["Fuze Site ID"].astype(str)
+_earliest_fm = (
+    all_df.groupby("Fuze Site ID").agg(Base_Month_Early=("Forecast Month","min")).reset_index()
+)
+_earliest_fm["Fuze Site ID"] = _earliest_fm["Fuze Site ID"].astype(str)
+_base_lookup = _base_fm_snap.merge(_earliest_fm, on="Fuze Site ID", how="right")
+_base_lookup["Base_Month"] = pd.to_datetime(
+    _base_lookup["Base_Month_Snap"].combine_first(_base_lookup["Base_Month_Early"])
+)
+_base_lookup = _base_lookup[["Fuze Site ID","Base_Month"]]
+det = det.merge(_base_lookup, on="Fuze Site ID", how="left")
+det["_Comp_Month"] = pd.to_datetime(det["Forecast Date"], errors="coerce")
+_latest_snap_month = pd.Timestamp(latest_snap).to_period("M").to_timestamp()
+
+def _det_classify(row):
+    if pd.isna(row["_Comp_Month"]):
+        return "Slipped"
+    if row["_Comp_Month"] < _latest_snap_month:
+        return "Slipped"
+    if pd.notna(row["Base_Month"]) and row["_Comp_Month"] <= row["Base_Month"]:
+        return "On Schedule"
+    return "Slipped"
+
+det["Status"] = det.apply(_det_classify, axis=1)
+det = det.drop(columns=["Base_Month","_Comp_Month"])
+det = det.sort_values(["Status","Phase","Market","Forecast Date"])
 detail_data = det.fillna("—").to_dict("records")
 
 print(f"Map sites: {len(map_sites):,}  |  Detail rows: {len(detail_data):,}")
@@ -210,6 +251,7 @@ JS_VARS = {
     "__SM_TO_MKT__":   json.dumps(sm_to_mkt),
     "__ALL_SNAPS__":   json.dumps(all_snap_data),
     "__ONAIR_IDS__":   json.dumps(onair_ids),
+    "__ONAIR_MAP__":   json.dumps(onair_map),
     "__MAP_SITES__":   json.dumps(map_sites),
     "__DETAIL__":      json.dumps(detail_data),
     "__LATEST_SNAP__": json.dumps(str(latest_snap)),
@@ -467,7 +509,40 @@ __PLOTLY_SCRIPT__
 
 <!-- DETAIL -->
 <div id="tab-detail" class="tab-content"><div class="page">
-  <div class="section-title">Site-Level Detail</div>
+  <div class="section-title">Site History</div>
+  <div class="filter-row" style="margin-bottom:8px;">
+    <div class="filter-group">
+      <label>Fuze Site ID</label>
+      <input type="text" class="filter-select" id="hist-site-id" placeholder="Enter site ID&hellip;"
+             style="min-width:220px;" onkeydown="if(event.key==='Enter')lookupSiteHistory()">
+    </div>
+    <div style="margin-top:22px;">
+      <button onclick="lookupSiteHistory()"
+              style="padding:6px 16px;border:1px solid #2196F3;border-radius:4px;background:#2196F3;color:#fff;font-family:inherit;font-size:.82rem;font-weight:600;cursor:pointer;">Look Up</button>
+    </div>
+  </div>
+  <div id="site-hist-panel" style="display:none;">
+    <div class="kpi-row-5" id="site-hist-kpi" style="margin-bottom:16px;"></div>
+    <div class="chart-card">
+      <div class="chart-title">Forecast Month History</div>
+      <div id="chart-site-hist" style="height:280px;"></div>
+    </div>
+    <div class="table-scroll" style="margin-top:12px;">
+      <table class="data-table">
+        <thead><tr>
+          <th>Snapshot</th><th>Forecast Month</th><th>Phase</th><th>Status</th><th class="right">VCG-OFS</th><th class="right">VBG-OFS</th><th class="right">In Report</th>
+        </tr></thead>
+        <tbody id="site-hist-tbody"></tbody>
+      </table>
+    </div>
+    <p class="caption-txt" id="site-hist-caption"></p>
+    <div style="margin-top:8px;">
+      <button onclick="exportSiteHistCSV()"
+              style="padding:5px 14px;border:1px solid #198754;border-radius:4px;background:#198754;color:#fff;font-family:inherit;font-size:.82rem;font-weight:600;cursor:pointer;">&#11015; Export CSV</button>
+    </div>
+  </div>
+  <hr style="margin:24px 0;border:none;border-top:1px solid #eee;">
+  <div class="section-title">Browse All Sites</div>
   <div class="filter-row">
     <div class="filter-group">
       <label>Sub Market</label>
@@ -492,6 +567,14 @@ __PLOTLY_SCRIPT__
       </select>
     </div>
     <div class="filter-group">
+      <label>Status</label>
+      <select class="filter-select" id="det-filter-status" onchange="filterDetail()" style="min-width:140px;">
+        <option value="">All Statuses</option>
+        <option value="On Schedule">On Schedule</option>
+        <option value="Slipped">Slipped</option>
+      </select>
+    </div>
+    <div class="filter-group">
       <label>Fuze Site ID</label>
       <input type="text" class="filter-select" id="det-filter-id" placeholder="Search site ID…" oninput="filterDetail()" style="min-width:180px;">
     </div>
@@ -502,7 +585,7 @@ __PLOTLY_SCRIPT__
   <div class="table-scroll">
     <table class="data-table">
       <thead><tr>
-        <th>Phase</th><th>Market</th><th>Sub Market</th><th>Fuze Site ID</th>
+        <th>Status</th><th>Phase</th><th>Market</th><th>Sub Market</th><th>Fuze Site ID</th>
         <th>Forecast Date</th><th class="right">VCG-OFS</th><th class="right">VBG-OFS</th>
       </tr></thead>
       <tbody id="detail-tbody"></tbody>
@@ -526,6 +609,7 @@ const SUBMARKET  = __SUBMARKET__;
 const SM_TO_MKT  = __SM_TO_MKT__;
 const ALL_SNAPS  = __ALL_SNAPS__;
 const ONAIR_IDS  = new Set(__ONAIR_IDS__);
+const ONAIR_MAP  = __ONAIR_MAP__;
 const MAP_SITES  = __MAP_SITES__;
 const DETAIL     = __DETAIL__;
 const LATEST_SNAP = __LATEST_SNAP__;
@@ -977,21 +1061,23 @@ function onDetSmChange() {
   filterDetail();
 }
 function filterDetail() {
-  const smFilter    = document.getElementById('det-filter-sm').value;
-  const mktFilter   = document.getElementById('det-filter-mkt').value;
-  const phaseFilter = document.getElementById('det-filter-phase').value;
-  const idFilter    = document.getElementById('det-filter-id').value.toLowerCase().trim();
+  const smFilter     = document.getElementById('det-filter-sm').value;
+  const mktFilter    = document.getElementById('det-filter-mkt').value;
+  const phaseFilter  = document.getElementById('det-filter-phase').value;
+  const statusFilter = document.getElementById('det-filter-status').value;
+  const idFilter     = document.getElementById('det-filter-id').value.toLowerCase().trim();
   _detFiltered = DETAIL.filter(r => {
-    if (smFilter    && r['Sub Market'] !== smFilter)    return false;
-    if (mktFilter   && r.Market        !== mktFilter)   return false;
-    if (phaseFilter && r.Phase         !== phaseFilter) return false;
-    if (idFilter    && !String(r['Fuze Site ID']).toLowerCase().includes(idFilter)) return false;
+    if (smFilter     && r['Sub Market'] !== smFilter)    return false;
+    if (mktFilter    && r.Market        !== mktFilter)   return false;
+    if (phaseFilter  && r.Phase         !== phaseFilter) return false;
+    if (statusFilter && r.Status        !== statusFilter) return false;
+    if (idFilter     && !String(r['Fuze Site ID']).toLowerCase().includes(idFilter)) return false;
     return true;
   });
   buildDetailRows(_detFiltered);
 }
 function exportDetailCSV() {
-  const cols = ['Phase','Market','Sub Market','Fuze Site ID','Forecast Date','VCG-OFS','VBG-OFS'];
+  const cols = ['Status','Phase','Market','Sub Market','Fuze Site ID','Forecast Date','VCG-OFS','VBG-OFS'];
   const rows = [cols.join(',')];
   (_detFiltered||DETAIL).forEach(r => {
     rows.push(cols.map(c => '"'+String(r[c]||'').replace(/"/g,'""')+'"').join(','));
@@ -1005,12 +1091,15 @@ function exportDetailCSV() {
 }
 function buildDetailRows(data) {
   const BC = {"30-Day":"badge-30","60-Day":"badge-60","90-Day":"badge-90","120-Day":"badge-120"};
+  const SC = {"On Schedule":"#198754","Slipped":"#dc3545"};
   const limit = Math.min(data.length, 3000);
   const parts = [];
   for (let i=0; i<limit; i++) {
     const r = data[i];
+    const scol = SC[r.Status] || '#444';
     parts.push(
-      '<tr><td><span class="badge '+(BC[r.Phase]||'')+'">'+(r.Phase||'')+'</span></td>' +
+      '<tr><td style="color:'+scol+';font-weight:600;">'+(r.Status||'')+'</td>' +
+      '<td><span class="badge '+(BC[r.Phase]||'')+'">'+(r.Phase||'')+'</span></td>' +
       '<td>'+(r.Market||'')+'</td><td>'+(r['Sub Market']||'')+'</td>' +
       '<td>'+(r['Fuze Site ID']||'')+'</td><td>'+(r['Forecast Date']||'')+'</td>' +
       '<td class="right">'+fmt(r['VCG-OFS'])+'</td>' +
@@ -1031,7 +1120,8 @@ function buildAdhDetailRows(data) {
     const r = data[i];
     const col = STATUS_COL[r.status] || '#444';
     parts.push(
-      '<tr><td>'+(r.id||'')+'</td><td>'+(r.mkt||'')+'</td><td>'+(r.sm||'')+'</td>' +
+      '<tr style="cursor:pointer;" title="Click to view site history" onclick="goToSiteHistory(' + (r.id||0) + ')">' +
+      '<td>'+(r.id||'')+'</td><td>'+(r.mkt||'')+'</td><td>'+(r.sm||'')+'</td>' +
       '<td><span style="color:'+col+';font-weight:600;">'+(r.status||'')+'</span></td>' +
       '<td class="right">'+(r.base||'')+'</td><td class="right">'+(r.comp||'')+'</td>' +
       '<td class="right">'+(r.months>0?r.months:'\u2014')+'</td></tr>');
@@ -1041,6 +1131,154 @@ function buildAdhDetailRows(data) {
   if (cap) cap.textContent = (limit<data.length
     ? 'Showing '+limit.toLocaleString()+' of '+data.length.toLocaleString()
     : data.length.toLocaleString())+' rows';
+}
+
+/* ── SITE HISTORY ── */
+function phaseLabel(fmStr) {
+  const today = new Date(TODAY_STR);
+  const cur   = new Date(today.getFullYear(), today.getMonth(), 1);
+  const fm    = new Date(fmStr + '-01');
+  const diff  = (fm.getFullYear() - cur.getFullYear()) * 12 + (fm.getMonth() - cur.getMonth());
+  if (diff === 0) return '30-Day';
+  if (diff === 1) return '60-Day';
+  if (diff === 2) return '90-Day';
+  if (diff === 3) return '120-Day';
+  return 'Beyond';
+}
+
+function lookupSiteHistory() {
+  const siteId = document.getElementById('hist-site-id').value.trim();
+  if (!siteId) return;
+  const snaps = Object.keys(ALL_SNAPS).sort();
+
+  // Find base FM and first appearance
+  let baseFm = null, firstSnap = null, mkt = '', sm = '';
+  snaps.forEach(s => {
+    const r = ALL_SNAPS[s].find(x => x.id === siteId);
+    if (r) {
+      if (!firstSnap) { firstSnap = s; mkt = r.mkt; sm = r.sm; }
+      if (!baseFm || r.fm < baseFm) baseFm = r.fm;
+    }
+  });
+
+  if (!baseFm) {
+    document.getElementById('site-hist-panel').style.display = 'none';
+    alert('No data found for Fuze Site ID: ' + siteId);
+    return;
+  }
+
+  const onAirDate = ONAIR_MAP[siteId] || '\u2014';
+
+  // KPI row
+  document.getElementById('site-hist-kpi').innerHTML =
+    '<div class="kpi-card"><div class="kpi-label">Market</div><div class="kpi-value" style="font-size:1rem;">' + (mkt||'\u2014') + '</div></div>' +
+    '<div class="kpi-card"><div class="kpi-label">Sub Market</div><div class="kpi-value" style="font-size:1rem;">' + (sm||'\u2014') + '</div></div>' +
+    '<div class="kpi-card"><div class="kpi-label">First Snapshot</div><div class="kpi-value" style="font-size:1rem;">' + firstSnap + '</div></div>' +
+    '<div class="kpi-card c-blue"><div class="kpi-label">Original FM</div><div class="kpi-value" style="font-size:1rem;">' + baseFm + '</div></div>' +
+    '<div class="kpi-card ' + (onAirDate!=='\u2014'?'c-green':'') + '"><div class="kpi-label">On Air Date</div><div class="kpi-value" style="font-size:1rem;">' + onAirDate + '</div></div>';
+
+  // Build history rows
+  const rows = [], chartX = [], chartY = [];
+  const STATUS_COL = {'On Schedule':'#198754','Slipped':'#dc3545','Completed':'#fd7e14','Dropped':'#6c757d'};
+  const BC = {'30-Day':'badge-30','60-Day':'badge-60','90-Day':'badge-90','120-Day':'badge-120'};
+
+  snaps.forEach(s => {
+    const r = ALL_SNAPS[s].find(x => x.id === siteId);
+    if (r) {
+      const snapMonthStr = s.substring(0, 7);
+      let status;
+      if (r.fm < snapMonthStr) {
+        status = 'Slipped';
+      } else if (r.fm <= baseFm) {
+        status = 'On Schedule';
+      } else {
+        status = 'Slipped';
+      }
+      rows.push({snap: s, fm: r.fm, phase: phaseLabel(r.fm), status, vcg: r.vcg||0, vbg: r.vbg||0, inReport: true});
+      chartX.push(s);
+      chartY.push(r.fm + '-01');
+    } else if (firstSnap && s > firstSnap) {
+      const status = ONAIR_IDS.has(siteId) ? 'Completed' : 'Dropped';
+      rows.push({snap: s, fm: '\u2014', phase: '\u2014', status, vcg: null, vbg: null, inReport: false});
+    }
+  });
+
+  // Timeline chart
+  Plotly.react('chart-site-hist', [
+    {type:'scatter', mode:'lines+markers',
+     x: chartX, y: chartY,
+     name: 'Forecast Month',
+     line: {color:'#0d6efd', width:2}, marker: {size:7},
+     hovertemplate: 'Snapshot: %{x}<br>Forecast Month: %{y|%b %Y}<extra></extra>'},
+    {type:'scatter', mode:'lines',
+     x: [chartX[0], chartX[chartX.length-1]],
+     y: [baseFm+'-01', baseFm+'-01'],
+     line: {color:'#6c757d', width:1, dash:'dash'},
+     showlegend: false, hoverinfo: 'skip'},
+  ], {
+    paper_bgcolor:'#fff', plot_bgcolor:'#fff',
+    font: {family:"'Segoe UI', sans-serif", size:11, color:'#444'},
+    xaxis: {showgrid:false, tickfont:{size:10}, title:'Snapshot'},
+    yaxis: {showgrid:true, gridcolor:'#f0f0f0', tickformat:'%b %Y', title:'Forecast Month', tickfont:{size:10}},
+    annotations: [{x:chartX[0], y:baseFm+'-01', text:'Original FM',
+      showarrow:false, yshift:12, xanchor:'left', font:{size:11, color:'#6c757d'}}],
+    margin: {t:20, r:20, b:50, l:90}, showlegend: false,
+  }, CFG);
+
+  // History table
+  const parts = [];
+  rows.forEach(r => {
+    const col   = STATUS_COL[r.status] || '#444';
+    const badge = r.phase !== '\u2014'
+      ? '<span class="badge '+(BC[r.phase]||'')+'">'+r.phase+'</span>' : '\u2014';
+    parts.push(
+      '<tr><td>'+r.snap+'</td><td>'+r.fm+'</td><td>'+badge+'</td>' +
+      '<td style="color:'+col+';font-weight:600;">'+r.status+'</td>' +
+      '<td class="right">'+(r.vcg!==null?fmt(r.vcg):'\u2014')+'</td>' +
+      '<td class="right">'+(r.vbg!==null?fmt(r.vbg):'\u2014')+'</td>' +
+      '<td class="right">'+(r.inReport?'&#10003;':'&#10007;')+'</td></tr>');
+  });
+  document.getElementById('site-hist-tbody').innerHTML = parts.join('');
+
+  const activeCount = rows.filter(r => r.inReport).length;
+  document.getElementById('site-hist-caption').textContent =
+    'Site ' + siteId + ' \u00b7 ' + activeCount + ' snapshots with active data \u00b7 ' + rows.length + ' total rows';
+  document.getElementById('site-hist-panel').style.display = 'block';
+  window._histExport = {siteId, rows};
+}
+
+function exportSiteHistCSV() {
+  if (!window._histExport) return;
+  const {siteId, rows} = window._histExport;
+  const header = ['Snapshot','Forecast Month','Phase','Status','VCG-OFS','VBG-OFS','In Report'];
+  const lines = [header.join(',')];
+  rows.forEach(r => {
+    lines.push([r.snap, r.fm, r.phase, r.status,
+      r.vcg !== null ? r.vcg : '',
+      r.vbg !== null ? r.vbg : '',
+      r.inReport ? 'Yes' : 'No'].join(','));
+  });
+  const blob = new Blob([lines.join('\\n')], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'site_' + siteId + '_history.csv';
+  a.click();
+}
+
+/* ── CLICK-TO-LOOKUP ── */
+function goToSiteHistory(siteId) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => {
+    if (b.textContent.trim() === 'Site Detail') b.classList.add('active');
+  });
+  document.getElementById('tab-detail').classList.add('active');
+  document.getElementById('hist-site-id').value = siteId;
+  setTimeout(function() {
+    renderDetail();
+    lookupSiteHistory();
+    document.getElementById('hist-site-id').scrollIntoView({behavior:'smooth', block:'center'});
+  }, 50);
 }
 
 /* ── TAB SWITCHING ── */
