@@ -11,7 +11,7 @@ import pandas as pd
 
 FOLDER      = Path(__file__).parent
 TODAY       = date.today()
-ONAIR_FILE  = Path(r"C:\Users\v296938\Desktop\04082026 FWA CBAND Capacity_Full Data_data.csv")
+ONAIR_FILE  = Path(r"C:\Users\v296938\Desktop\04202026 FWA CBAND Capacity_Full Data.xlsx")
 OUTPUT      = FOLDER / "sqdb_dashboard.html"
 PLOTLY_FILE = FOLDER / "plotly-2.35.2.min.js"
 PHASES      = ["30-Day", "60-Day", "90-Day", "120-Day"]
@@ -78,7 +78,7 @@ print(f"Latest: {latest_snap}  |  {len(snapshots)} weeks")
 print("Loading on-air dates…")
 onair_map = {}
 if ONAIR_FILE.exists():
-    odf = pd.read_csv(ONAIR_FILE, usecols=["Fuze Site ID", "On Air Date"])
+    odf = pd.read_excel(ONAIR_FILE, usecols=["Fuze Site ID", "On Air Date"], engine="openpyxl")
     odf["On Air Date"] = pd.to_datetime(odf["On Air Date"], errors="coerce")
     raw = (odf.dropna(subset=["Fuze Site ID"])
               .groupby("Fuze Site ID")["On Air Date"]
