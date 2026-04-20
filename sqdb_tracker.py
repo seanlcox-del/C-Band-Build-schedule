@@ -520,11 +520,13 @@ with tab_adherence:
 
     onair_df = load_onair_dates()
     onair_ids = set(onair_df["Fuze Site ID"].dropna().astype(str))
+    onair_date_map = dict(zip(onair_df["Fuze Site ID"].astype(str), onair_df["On Air Date"]))
     comp_snap_month = pd.Timestamp(comp_date).to_period("M").to_timestamp()
 
     def classify(row):
         if pd.isna(row["Comp_Month"]):
-            return "Completed" if str(row["Fuze Site ID"]) in onair_ids else "Dropped"
+            oa = onair_date_map.get(str(row["Fuze Site ID"]))
+            return "Completed" if (oa is not None and pd.notna(oa) and oa <= pd.Timestamp(comp_date)) else "Dropped"
         if row["Comp_Month"] < comp_snap_month:
             return "Slipped"  # Past due — still on report but forecast month already passed
         if row["Comp_Month"] <= row["Base_Month"]:
@@ -565,7 +567,8 @@ with tab_adherence:
         snap_month = pd.Timestamp(snap).to_period("M").to_timestamp()
         def _classify(row, _sm=snap_month):
             if pd.isna(row["Comp_Month"]):
-                return "Completed" if str(row["Fuze Site ID"]) in onair_ids else "Dropped"
+                oa = onair_date_map.get(str(row["Fuze Site ID"]))
+                return "Completed" if (oa is not None and pd.notna(oa) and oa <= _sm) else "Dropped"
             if row["Comp_Month"] < _sm:
                 return "Slipped"
             return "On Schedule" if row["Comp_Month"] <= row["Base_Month"] else "Slipped"
@@ -849,7 +852,7 @@ with tab_detail:
                     hist_rows.append({"Snapshot": snap, "Forecast Month": fm.strftime("%b %Y"),
                                       "Phase": phase, "Status": status, "VCG-OFS": vcg, "VBG-OFS": vbg, "In Report": "✓"})
                 elif snap > first_snap:
-                    status = "Completed" if site_id_input.strip() in _det_onair_ids else "Dropped"
+                    status = "Completed" if (pd.notna(on_air_date) and on_air_date.date() <= snap) else "Dropped"
                     hist_rows.append({"Snapshot": snap, "Forecast Month": "—",
                                       "Phase": "—", "Status": status, "VCG-OFS": "—", "VBG-OFS": "—", "In Report": "✗"})
 
@@ -966,7 +969,7 @@ with tab_map:
             hist = hist[hist["Market"].isin(map_markets)]
         comp_sites = hist.sort_values("Snapshot", ascending=False).drop_duplicates("Fuze Site ID").copy()
         comp_sites = comp_sites.merge(onair_df[["Fuze Site ID", "On Air Date"]], on="Fuze Site ID", how="left")
-        comp_sites["_Category"] = comp_sites["On Air Date"].apply(lambda d: "Completed" if pd.notna(d) else "Dropped")
+        comp_sites["_Category"] = comp_sites["On Air Date"].apply(lambda d: "Completed" if pd.notna(d) and d.date() <= latest_snap else "Dropped")
         comp_sites["_ForecastDate"] = pd.to_datetime(comp_sites["Forecast Date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("—") if "Forecast Date" in comp_sites.columns else "—"
         comp_sites["_VCG"] = comp_sites["VCG-OFS"].fillna(0).astype(int) if "VCG-OFS" in comp_sites.columns else 0
         comp_sites["_VBG"] = comp_sites["VBG-OFS"].fillna(0).astype(int) if "VBG-OFS" in comp_sites.columns else 0
