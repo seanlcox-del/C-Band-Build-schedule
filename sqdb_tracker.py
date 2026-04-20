@@ -35,10 +35,10 @@ def phase_label(month_ts):
 
 @st.cache_data(show_spinner="Loading on-air dates…")
 def load_onair_dates():
-    path = Path(r"C:\Users\v296938\Desktop\04082026 FWA CBAND Capacity_Full Data_data.csv")
+    path = Path(r"C:\Users\v296938\Desktop\04202026 FWA CBAND Capacity_Full Data.xlsx")
     if not path.exists():
         return pd.DataFrame(columns=["Fuze Site ID", "On Air Date"])
-    odf = pd.read_csv(path, usecols=["Fuze Site ID", "On Air Date"])
+    odf = pd.read_excel(path, usecols=["Fuze Site ID", "On Air Date"], engine="openpyxl")
     odf["On Air Date"] = pd.to_datetime(odf["On Air Date"], errors="coerce")
     return odf.dropna(subset=["Fuze Site ID"]).groupby("Fuze Site ID")["On Air Date"].min().reset_index()
 
