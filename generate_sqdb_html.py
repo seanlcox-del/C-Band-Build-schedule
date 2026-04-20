@@ -194,7 +194,7 @@ for _, r in prep_coords(hist_dedup).iterrows():
     map_sites.append({"id": sid, "mkt": str(r.get("Market","")),
                       "sub": str(r.get("Sub Market","")), "lat": round(float(r["_lat"]),6),
                       "lon": round(float(r["_lon"]),6),
-                      "cat": "Completed" if sid in onair_map else "Dropped",
+                      "cat": "Completed" if (sid in onair_map and isinstance(onair_map[sid], str) and onair_map[sid] <= str(latest_snap)) else "Dropped",
                       "fd": fd, "vcg": int(r.get("VCG-OFS",0) or 0),
                       "vbg": int(r.get("VBG-OFS",0) or 0), "oa": onair_map.get(sid,"—")})
 
@@ -790,7 +790,7 @@ function _computeAdh(baseSnap, compSnap) {
     let status, months = 0;
     const compFm = compMap[id];
     if (!compFm) {
-      status = ONAIR_IDS.has(id) ? 'Completed' : 'Dropped';
+      status = (ONAIR_MAP[id] && ONAIR_MAP[id] <= compSnap) ? 'Completed' : 'Dropped';
     } else {
       const bDate = new Date(site.baseFm + '-01');
       const cDate = new Date(compFm     + '-01');
@@ -1198,7 +1198,7 @@ function lookupSiteHistory() {
       chartX.push(s);
       chartY.push(r.fm + '-01');
     } else if (firstSnap && s > firstSnap) {
-      const status = ONAIR_IDS.has(siteId) ? 'Completed' : 'Dropped';
+      const status = (ONAIR_MAP[siteId] && ONAIR_MAP[siteId] <= s) ? 'Completed' : 'Dropped';
       rows.push({snap: s, fm: '\u2014', phase: '\u2014', status, vcg: null, vbg: null, inReport: false});
     }
   });
