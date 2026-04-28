@@ -455,6 +455,12 @@ __PLOTLY_SCRIPT__
   </div>
   <div class="section-title" id="adh-caption" style="margin-bottom:12px;"></div>
   <div class="kpi-row-5" id="adh-kpi-row"></div>
+  <div class="section-title" id="fc-acc-title" style="margin-top:20px;display:none;">Forecast Accuracy &mdash; Completed Sites</div>
+  <div class="kpi-row-4" id="fc-acc-kpi-row" style="display:none;"></div>
+  <div class="chart-card" id="fc-acc-chart-card" style="margin-top:14px;display:none;">
+    <div class="chart-title">Completed Sites by Forecast Attempt</div>
+    <div id="chart-fc-acc" style="height:280px;"></div>
+  </div>
   <div class="chart-card" style="margin-top:16px;">
     <div class="chart-title">Status Trend (Baseline → Each Snapshot)</div>
     <div id="chart-adh-trend" style="height:300px;"></div>
@@ -762,6 +768,7 @@ function renderMarketChart() {
 
 /* ── ADHERENCE ── */
 let _adhInit = false;
+let _fmTimeline = null;  // id -> [fm1, fm2, ...] ordered by first appearance across snapshots
 
 function _computeAdh(baseSnap, compSnap) {
   const snaps = Object.keys(ALL_SNAPS).sort();
@@ -825,6 +832,15 @@ function renderAdherence() {
     const smSel = document.getElementById('adh-filter-sm');
     sms.forEach(sm => { smSel.innerHTML += '<option value="'+sm+'">'+sm+'</option>'; });
     _adhPopulateMktFilter('');
+    // Precompute FM timeline: for each site, ordered list of distinct FMs by first appearance
+    _fmTimeline = {};
+    const snapsSorted = Object.keys(ALL_SNAPS).sort();
+    snapsSorted.forEach(s => {
+      ALL_SNAPS[s].forEach(r => {
+        if (!_fmTimeline[r.id]) _fmTimeline[r.id] = [];
+        if (_fmTimeline[r.id].indexOf(r.fm) === -1) _fmTimeline[r.id].push(r.fm);
+      });
+    });
   }
   renderAdherenceCharts();
 }
@@ -937,6 +953,9 @@ function renderAdherenceCharts() {
   // Adherence site-level table
   buildAdhDetailRows(data);
 
+  // Forecast accuracy KPIs (completed sites only)
+  renderForecastAccuracyKPIs(data);
+
   // Market adherence bar — group by market
   const mktMap = {};
   data.forEach(r => {
@@ -971,6 +990,87 @@ function renderAdherenceCharts() {
       yaxis:{showgrid:false, tickfont:{size:10}, automargin:true},
       legend:{orientation:'h', y:-0.06, x:0.5, xanchor:'center', font:{size:11}},
       margin:{t:10,r:20,b:80,l:160}, height:h}, CFG);
+}
+
+/* ── FORECAST ACCURACY KPIs ── */
+function renderForecastAccuracyKPIs(data) {
+  const kpiEl   = document.getElementById('fc-acc-kpi-row');
+  const titleEl = document.getElementById('fc-acc-title');
+  if (!kpiEl || !_fmTimeline) return;
+
+  const completed = data.filter(r => r.status === 'Completed');
+  const total = completed.length;
+
+  if (total === 0) {
+    kpiEl.style.display   = 'none';
+    titleEl.style.display = 'none';
+    return;
+  }
+
+  let cnt1 = 0, cnt2 = 0, cnt3plus = 0, cntOther = 0;
+  completed.forEach(site => {
+    const onAirDate = ONAIR_MAP[site.id];
+    if (!onAirDate) { cntOther++; return; }
+    const onAirMonth = onAirDate.substring(0, 7);
+    const fms = _fmTimeline[site.id] || [];
+    const idx = fms.indexOf(onAirMonth);
+    if      (idx === 0) cnt1++;
+    else if (idx === 1) cnt2++;
+    else if (idx >= 2)  cnt3plus++;
+    else                cntOther++;
+  });
+
+  const pct = n => (n / total * 100).toFixed(1) + '%';
+
+  kpiEl.style.display   = '';
+  titleEl.style.display = '';
+  document.getElementById('fc-acc-chart-card').style.display = '';
+  kpiEl.innerHTML =
+    '<div class="kpi-card c-green">' +
+      '<div class="kpi-label">1st Forecast Date</div>' +
+      '<div class="kpi-value">' + fmt(cnt1) + '</div>' +
+      '<div class="kpi-sub">' + pct(cnt1) + ' of completed &mdash; never slipped</div>' +
+    '</div>' +
+    '<div class="kpi-card c-blue">' +
+      '<div class="kpi-label">2nd Forecast Date</div>' +
+      '<div class="kpi-value">' + fmt(cnt2) + '</div>' +
+      '<div class="kpi-sub">' + pct(cnt2) + ' of completed &mdash; slipped once</div>' +
+    '</div>' +
+    '<div class="kpi-card c-orange">' +
+      '<div class="kpi-label">3rd+ Forecast Date</div>' +
+      '<div class="kpi-value">' + fmt(cnt3plus) + '</div>' +
+      '<div class="kpi-sub">' + pct(cnt3plus) + ' of completed &mdash; slipped 2+ times</div>' +
+    '</div>' +
+    '<div class="kpi-card">' +
+      '<div class="kpi-label">On Air Month Not in FM History</div>' +
+      '<div class="kpi-value">' + fmt(cntOther) + '</div>' +
+      '<div class="kpi-sub">' + pct(cntOther) + ' of completed</div>' +
+    '</div>';
+
+  const labels = ['1st Forecast Date', '2nd Forecast Date', '3rd+ Forecast Date', 'Not in FM History'];
+  const counts = [cnt1, cnt2, cnt3plus, cntOther];
+  const colors = ['#198754', '#0d6efd', '#fd7e14', '#6c757d'];
+  Plotly.react('chart-fc-acc', [{
+    type: 'bar',
+    x: labels,
+    y: counts,
+    marker: { color: colors },
+    text: counts.map((n, i) => fmt(n) + '<br>' + pct(n)),
+    textposition: 'outside',
+    hovertemplate: '<b>%{x}</b><br>Sites: %{y:,}<br>' +
+      counts.map((n, i) => (n/total*100).toFixed(1)+'%')[0] + '<extra></extra>',
+    hoverinfo: 'x+y',
+    customdata: counts.map(n => (n/total*100).toFixed(1)+'%'),
+    hovertemplate: '<b>%{x}</b><br>Sites: %{y:,}<br>%{customdata}<extra></extra>',
+  }], {
+    paper_bgcolor: '#fff', plot_bgcolor: '#fff',
+    font: {family: "'Segoe UI', sans-serif", size: 11, color: '#444'},
+    xaxis: {showgrid: false, tickfont: {size: 11}},
+    yaxis: {showgrid: true, gridcolor: '#f0f0f0', rangemode: 'tozero',
+            title: 'Sites', tickfont: {size: 10}},
+    margin: {t: 30, r: 20, b: 60, l: 60},
+    showlegend: false,
+  }, CFG);
 }
 
 /* ── MAP ── */
